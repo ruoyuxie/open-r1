@@ -26,51 +26,32 @@ from transformers.trainer_utils import get_last_checkpoint
 
 from open_r1.configs import GRPOConfig
 from open_r1.rewards import (
-    accuracy_reward,
-    code_reward,
-    format_reward,
-    get_code_format_reward,
+    accuracy_reward_normal,
+    format_reward_normal,
+    accuracy_reward_gsm,
+    format_reward_gsm,
+    combined_reward_gsm,
     get_cosine_scaled_reward,
     get_repetition_penalty_reward,
     len_reward,
     reasoning_steps_reward,
-    tag_count_reward,
+    accuracy_reward_inter,
+    format_reward_inter,
 )
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
-
+from prompts import NORMAL_SYSTEM_PROMPT, INTER_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
-    """
-    Script arguments for the GRPO training script.
-
-    Args:
-        reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'.
-        cosine_min_value_wrong (`float`):
-            Minimum reward for cosine scaling for wrong answers.
-        cosine_max_value_wrong (`float`):
-            Maximum reward for cosine scaling for wrong answers.
-        cosine_min_value_correct (`float`):
-            Minimum reward for cosine scaling for correct answers.
-        cosine_max_value_correct (`float`):
-            Maximum reward for cosine scaling for correct answers.
-        cosine_max_len (`int`):
-            Maximum length for cosine scaling.
-        code_language (`str`):
-            Language for code format reward.
-    """
-
     reward_funcs: list[str] = field(
-        default_factory=lambda: ["accuracy", "format", "tag_count"],
+        default_factory=lambda: ["accuracy", "format"],
         metadata={
-            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'"
+            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', 'accuracy_inter', 'format_inter'"
         },
     )
     cosine_min_value_wrong: float = field(
@@ -93,6 +74,7 @@ class GRPOScriptArguments(ScriptArguments):
         default=1000,
         metadata={"help": "Maximum length for scaling"},
     )
+
     repetition_n_grams: int = field(
         default=3,
         metadata={"help": "Number of n-grams for repetition penalty reward"},
@@ -101,19 +83,14 @@ class GRPOScriptArguments(ScriptArguments):
         default=-1.0,
         metadata={"help": "Maximum (negative) penalty for for repetition penalty reward"},
     )
-    code_language: str = field(
-        default="python",
-        metadata={
-            "help": "Language for code format reward. Based on E2B supported languages https://e2b.dev/docs/code-interpreting/supported-languages",
-            "choices": ["python", "javascript", "r", "java", "bash"],
-        },
-    )
 
 
-def main(script_args, training_args, model_args):
+def main(script_args, training_args, model_args, PROMPT_STYLE):
     # Set seed for reproducibility
     set_seed(training_args.seed)
-
+    # clean gpu cache
+    torch.cuda.empty_cache()
+    
     ###############
     # Setup logging
     ###############
@@ -147,23 +124,32 @@ def main(script_args, training_args, model_args):
 
     if "wandb" in training_args.report_to:
         init_wandb_training(training_args)
-
-    # Load the dataset
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
-    
-    # only use some samples
-    dataset["train"] = dataset["train"].shuffle().select(range(20))
-    dataset["test"] = dataset["test"].shuffle().select(range(5))
-    
+   
     ################
     # Load tokenizer
     ################
     tokenizer = get_tokenizer(model_args, training_args)
-
+    tokenizer.padding_side = 'left'
+    # Load the dataset
+    # dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    dataset = load_dataset('openai/gsm8k', 'main')
+    # change the colunm name "question" to "problem" and "answer" to "solution" if they exist
+    if "question" in dataset["train"].column_names:
+        dataset = dataset.rename_column("question", "problem")
+    if "answer" in dataset["train"].column_names:
+        dataset = dataset.rename_column("answer", "solution")
+        
+    # only use some samples
+    dataset["train"] = dataset["train"].shuffle().select(range(5))
+    dataset["test"] = dataset["test"].shuffle().select(range(2))
+    
     # Get reward functions
     REWARD_FUNCS_REGISTRY = {
-        "accuracy": accuracy_reward,
-        "format": format_reward,
+        "accuracy": accuracy_reward_normal,
+        "format": format_reward_normal,
+        "accuracy_gsm": accuracy_reward_gsm,
+        "format_gsm": format_reward_gsm,
+        "combined_gsm": combined_reward_gsm,
         "reasoning_steps": reasoning_steps_reward,
         "cosine": get_cosine_scaled_reward(
             min_value_wrong=script_args.cosine_min_value_wrong,
@@ -177,24 +163,24 @@ def main(script_args, training_args, model_args):
             max_penalty=script_args.repetition_max_penalty,
         ),
         "length": len_reward,
-        "code": code_reward,
-        "code_format": get_code_format_reward(language=script_args.code_language),
-        "tag_count": tag_count_reward,
+        "accuracy_inter": accuracy_reward_inter,
+        "format_inter": format_reward_inter,
     }
-    reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
-
+    reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in["accuracy_gsm", "format_gsm", "combined_gsm"]] if PROMPT_STYLE == "normal" else [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
+    
+    SYSTEM_PROMPT = NORMAL_SYSTEM_PROMPT if PROMPT_STYLE == "normal" else INTER_SYSTEM_PROMPT
+    
     # Format into conversation
     def make_conversation(example):
-        prompt = []
-
-        if training_args.system_prompt is not None:
-            prompt.append({"role": "system", "content": training_args.system_prompt})
-
-        prompt.append({"role": "user", "content": example["problem"]})
-        return {"prompt": prompt}
+        return {
+            "prompt": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": example["problem"]},
+            ],
+            "solution": example["answer"] if "answer" in example else example["solution"], # for GSM dataset
+        }
 
     dataset = dataset.map(make_conversation)
-
     for split in dataset:
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
@@ -229,6 +215,7 @@ def main(script_args, training_args, model_args):
     ###############
     # Training loop
     ###############
+    
     logger.info("*** Train ***")
     checkpoint = None
     if training_args.resume_from_checkpoint is not None:
@@ -265,10 +252,16 @@ def main(script_args, training_args, model_args):
     ##########
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
-        metrics = trainer.evaluate()
-        metrics["eval_samples"] = len(dataset[script_args.dataset_test_split])
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
+        try:
+            # trainer.tokenizer.padding_side = 'left'
+            metrics = trainer.evaluate()
+            metrics["eval_samples"] = len(dataset[script_args.dataset_test_split])
+            trainer.log_metrics("eval", metrics)
+            trainer.save_metrics("eval", metrics)
+        except Exception as e:
+            logger.error(f"Error during evaluation: {e}")
+            # print the tokenization specification
+            logger.error(f"Tokenizer: {trainer.tokenizer}")
 
     #############
     # push to hub
@@ -279,6 +272,12 @@ def main(script_args, training_args, model_args):
 
 
 if __name__ == "__main__":
+    CONFIG_PATH = "/usr/project/xtmp/rx55/projects/long_cot/src/open-r1/src/open_r1/my_config.yaml"
+    PROMPT_STYLE = "normal" #@param ["normal", "inter"]
+    print(f"Using {PROMPT_STYLE} prompt style")
+    sys.argv = [sys.argv[0]] + ["--config", CONFIG_PATH]
+
+    # Original parsing logic
     parser = TrlParser((GRPOScriptArguments, GRPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
-    main(script_args, training_args, model_args)
+    main(script_args, training_args, model_args, PROMPT_STYLE)
